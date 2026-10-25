@@ -1,0 +1,142 @@
+package com.example.maxcapture
+
+import android.Manifest
+import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.pm.PackageManager
+import android.graphics.Color
+import android.graphics.SurfaceTexture
+import android.hardware.camera2.CameraCaptureSession
+import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.CameraDevice
+import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureRequest
+import android.os.Bundle
+import android.os.Handler
+import android.os.HandlerThread
+import android.util.Size
+import android.view.Surface
+import android.view.TextureView
+import android.view.ViewGroup
+import android.widget.FrameLayout
+import android.widget.ScrollView
+import android.widget.TextView
+
+class MainActivity : Activity() {
+
+    private lateinit var textureView: TextureView
+    private lateinit var logView: TextView
+    private var camera: CameraDevice? = null
+    private var session: CameraCaptureSession? = null
+    private val thread = HandlerThread("camera").apply { start() }
+    private val handler by lazy { Handler(thread.looper) }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val root = FrameLayout(this)
+        textureView = TextureView(this)
+        root.addView(textureView, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+
+        logView = TextView(this).apply {
+            setTextColor(Color.GREEN)
+            setBackgroundColor(Color.argb(160, 0, 0, 0))
+            textSize = 11f
+            setPadding(16, 48, 16, 16)
+        }
+        val scroll = ScrollView(this).apply { addView(logView) }
+        root.addView(scroll, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 700))
+        setContentView(root)
+
+        textureView.surfaceTextureListener = object : TextureView.SurfaceTextureListener {
+            override fun onSurfaceTextureAvailable(s: SurfaceTexture, w: Int, h: Int) = tryStart()
+            override fun onSurfaceTextureSizeChanged(s: SurfaceTexture, w: Int, h: Int) {}
+            override fun onSurfaceTextureDestroyed(s: SurfaceTexture) = true
+            override fun onSurfaceTextureUpdated(s: SurfaceTexture) {}
+        }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        tryStart()
+    }
+
+    override fun onPause() {
+        session?.close(); session = null
+        camera?.close(); camera = null
+        super.onPause()
+    }
+
+    override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
+        super.onRequestPermissionsResult(code, perms, results)
+        tryStart()
+    }
+
+    private fun log(msg: String) = runOnUiThread { logView.append(msg + "\n") }
+
+    private fun tryStart() {
+        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(arrayOf(Manifest.permission.CAMERA), 1)
+            return
+        }
+        if (!textureView.isAvailable || camera != null) return
+        openCamera()
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun openCamera() {
+        val manager = getSystemService(CAMERA_SERVICE) as CameraManager
+        val id = manager.cameraIdList.firstOrNull {
+            manager.getCameraCharacteristics(it)
+                .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
+        } ?: run { log("No back camera"); return }
+
+        val chars = manager.getCameraCharacteristics(id)
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
+        val sizes = map.getOutputSizes(SurfaceTexture::class.java).toList()
+        val largest = sizes.maxByOrNull { it.width.toLong() * it.height }!!
+        val uhd = Size(3840, 2160)
+        val target = if (sizes.contains(uhd)) uhd else largest
+
+        log("Camera id: $id")
+        log("Largest output: ${largest.width}x${largest.height}")
+        log("4K advertised: ${sizes.contains(uhd)}")
+        val ranges = chars.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+        log("FPS ranges: ${ranges?.joinToString()}")
+        val fps60 = ranges?.filter { it.upper >= 60 }?.maxByOrNull { it.lower }
+        log("60fps range: ${fps60 ?: "none"}")
+        log("Trying ${target.width}x${target.height} @ ${fps60?.upper ?: "default"}fps ...")
+
+        manager.openCamera(id, object : CameraDevice.StateCallback() {
+            override fun onOpened(cam: CameraDevice) {
+                camera = cam
+                startSession(cam, target, fps60)
+            }
+            override fun onDisconnected(cam: CameraDevice) { cam.close(); camera = null }
+            override fun onError(cam: CameraDevice, error: Int) {
+                log("Camera error $error"); cam.close(); camera = null
+            }
+        }, handler)
+    }
+
+    @Suppress("DEPRECATION")
+    private fun startSession(cam: CameraDevice, size: Size, fps: android.util.Range<Int>?) {
+        val st = textureView.surfaceTexture ?: return
+        st.setDefaultBufferSize(size.width, size.height)
+        val surface = Surface(st)
+        val req = cam.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+            addTarget(surface)
+            fps?.let { set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, it) }
+        }
+        cam.createCaptureSession(listOf(surface), object : CameraCaptureSession.StateCallback() {
+            override fun onConfigured(s: CameraCaptureSession) {
+                session = s
+                s.setRepeatingRequest(req.build(), null, handler)
+                log("RESULT: ACCEPTED ${size.width}x${size.height} @ ${fps?.upper ?: "default"}fps")
+            }
+            override fun onConfigureFailed(s: CameraCaptureSession) {
+                log("RESULT: REJECTED ${size.width}x${size.height}")
+            }
+        }, handler)
+    }
+}
